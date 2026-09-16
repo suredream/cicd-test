@@ -1,0 +1,927 @@
+# myexpand POC SPEC
+
+## 1. Purpose
+
+`myexpand` is a minimal Windows global text-expander proof of concept implemented in Python.
+
+The POC validates four capabilities only:
+
+1. Listen to global keyboard input while `myexpand` is running.
+2. Detect exact text triggers such as `\\a`.
+3. Remove the typed trigger with Backspace events.
+4. Inject a configured replacement such as `testtesttest`.
+
+Configuration is stored in YAML. The only external runtime dependencies are:
+
+- `pynput`
+- `PyYAML`
+
+The POC is intended for a user's own Windows session and ordinary desktop applications such as Notepad, browsers, Word, Outlook, Teams, and VS Code. It is not intended to capture or persist typed content.
+
+---
+
+## 2. Goals
+
+### Functional goals
+
+Given this configuration:
+
+```yaml
+expansions:
+  "\\\\a": "testtesttest"
+  "\\\\2m": "Give me a two-minute overview."
+```
+
+when the user types:
+
+```text
+\\a
+```
+
+in a normal editable text field, the visible text should become:
+
+```text
+testtesttest
+```
+
+The same process must continue listening after an expansion occurs.
+
+### POC success criteria
+
+The POC is successful if:
+
+- it runs on Windows 10/11 using a normal user account;
+- it detects configured triggers globally;
+- trigger replacement works in at least Notepad, a Chromium browser text field, and VS Code;
+- injected replacement text does not recursively trigger the listener;
+- no keystroke contents are written to disk;
+- configuration changes can be applied by restarting the process.
+
+---
+
+## 3. Non-goals
+
+The POC will NOT implement:
+
+- `pywin32` or `psutil`;
+- Windows Service support;
+- system tray UI;
+- application-aware include/exclude rules;
+- clipboard-based replacement;
+- regex triggers;
+- hotkeys or command execution;
+- dynamic config reload;
+- per-application profiles;
+- GUI configuration editor;
+- cloud sync;
+- startup installer;
+- telemetry;
+- persistence of keyboard events;
+- password-field detection;
+- advanced IME handling;
+- elevated/UAC desktop support.
+
+Packaging as an `.exe` may be explored after the POC, but is not required for acceptance.
+
+---
+
+## 4. Technology
+
+### Runtime
+
+- Python 3.12+
+- Windows 10 or Windows 11
+
+### External dependencies
+
+```toml
+dependencies = [
+    "pynput>=1.7,<2",
+    "PyYAML>=6,<7",
+]
+```
+
+### Standard-library modules
+
+Expected modules include:
+
+```text
+argparse
+logging
+pathlib
+threading
+time
+signal
+sys
+```
+
+No other external package should be introduced in the POC without changing this spec.
+
+---
+
+## 5. Project layout
+
+```text
+myexpand/
+├── pyproject.toml
+├── README.md
+├── config.example.yaml
+├── src/
+│   └── myexpand/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── app.py
+│       ├── config.py
+│       └── expander.py
+└── tests/
+    ├── test_config.py
+    └── test_matching.py
+```
+
+Responsibilities:
+
+### `config.py`
+
+- load YAML;
+- validate `expansions`;
+- return a normalized configuration object.
+
+### `expander.py`
+
+- own keyboard listener state;
+- maintain rolling buffer;
+- detect triggers;
+- delete trigger text;
+- inject replacement text;
+- prevent injected-event recursion.
+
+### `app.py`
+
+- initialize logging;
+- load configuration;
+- construct expander;
+- start and stop listener;
+- handle fatal errors.
+
+### `__main__.py`
+
+Allow:
+
+```bash
+uv run python -m myexpand --config config.yaml
+```
+
+---
+
+## 6. Configuration
+
+### Schema
+
+```yaml
+expansions:
+  <trigger>: <replacement>
+```
+
+Both trigger and replacement MUST be strings.
+
+Example:
+
+```yaml
+expansions:
+  "\\\\a": "testtesttest"
+  "\\\\2m": "Give me a two-minute overview."
+  "\\\\sig": "Best regards,"
+```
+
+Because YAML double-quoted strings treat backslash as an escape character, a literal `\\a` trigger is represented as:
+
+```yaml
+"\\\\a"
+```
+
+An alternative user-friendly form using single quotes is preferred in documentation:
+
+```yaml
+expansions:
+  '\\a': 'testtesttest'
+  '\\2m': 'Give me a two-minute overview.'
+```
+
+### Validation rules
+
+Startup MUST fail with a clear error if:
+
+- `expansions` is absent;
+- `expansions` is not a mapping;
+- a trigger is empty;
+- a trigger is not a string;
+- a replacement is not a string;
+- two normalized triggers collide.
+
+Empty replacement strings MAY be allowed and mean "delete the trigger".
+
+---
+
+## 7. Runtime architecture
+
+```text
+                config.yaml
+                    │
+                    ▼
+              Config Loader
+                    │
+                    ▼
+              Expansion Map
+                    │
+                    ▼
+Windows keyboard → pynput Listener
+                    │
+                    ▼
+              Rolling Buffer
+                    │
+             trigger matched?
+                │        │
+               no       yes
+                │        │
+                │        ▼
+                │   injection guard ON
+                │        │
+                │   send Backspace × N
+                │        │
+                │   type replacement
+                │        │
+                │   clear buffer
+                │        │
+                │   injection guard OFF
+                └────────┘
+```
+
+The process is long-running but remains an ordinary user-space Python process.
+
+---
+
+## 8. Internal state
+
+The expander maintains only short-lived in-memory state.
+
+```python
+buffer: str
+max_trigger_length: int
+injecting: bool
+expansions: dict[str, str]
+```
+
+### `buffer`
+
+Contains only the most recent characters necessary to identify a trigger.
+
+Maximum length:
+
+```text
+max_trigger_length = max(len(trigger) for trigger in expansions)
+```
+
+The implementation MUST NOT maintain a full history of user typing.
+
+### `injecting`
+
+When `True`, keyboard events generated by `myexpand` itself are ignored.
+
+This prevents replacement text from being interpreted as new user input.
+
+---
+
+## 9. Matching behavior
+
+### Exact suffix matching
+
+After every printable character:
+
+```text
+buffer = (buffer + character)[-max_trigger_length:]
+```
+
+Then test whether the buffer ends with a configured trigger.
+
+Example:
+
+```text
+Configured trigger: \\a
+
+Input sequence:
+h → buffer h
+i → buffer hi
+  → buffer hi \\\ → buffer i \\\a → MATCH
+```
+
+For the POC, exact suffix matching is sufficient.
+
+### Multiple trigger lengths
+
+Example:
+
+```yaml
+expansions:
+  '\\a': 'A'
+  '\\abc': 'ABC'
+```
+
+On each keystroke, the matcher SHOULD prefer the longest matching trigger.
+
+Implementation approach:
+
+```python
+matches = [t for t in expansions if buffer.endswith(t)]
+trigger = max(matches, key=len) if matches else None
+```
+
+For a small personal configuration this O(N) search is acceptable.
+
+A trie is explicitly unnecessary for the POC.
+
+---
+
+## 10. Keyboard-event behavior
+
+### Printable characters
+
+For an event where `key.char` is available:
+
+1. if `injecting == True`, ignore it;
+2. append character to rolling buffer;
+3. check for trigger;
+4. expand if matched.
+
+### Backspace
+
+A user-generated Backspace SHOULD remove one character from the rolling buffer:
+
+```python
+buffer = buffer[:-1]
+```
+
+This is important for correcting partially typed triggers.
+
+### Boundary/special keys
+
+The following user-generated keys SHOULD clear the buffer in the POC:
+
+- Enter
+- Tab
+- Escape
+- arrow keys
+- Home
+- End
+- Page Up
+- Page Down
+- Delete
+
+Space SHOULD be treated as a normal character or clear the buffer; the POC chooses **clear the buffer** because all initial triggers are contiguous tokens beginning with `\\`.
+
+Modifier-only keys such as Shift, Ctrl, Alt, and Windows SHOULD be ignored rather than appended.
+
+---
+
+## 11. Expansion algorithm
+
+When trigger `T` maps to replacement `R`:
+
+```text
+1. Set injecting = True.
+2. Send len(T) Backspace key events.
+3. Type R using pynput.keyboard.Controller.type().
+4. Clear the rolling buffer.
+5. Set injecting = False in a finally block.
+```
+
+Pseudocode:
+
+```python
+def expand(trigger: str, replacement: str) -> None:
+    self.injecting = True
+    try:
+        for _ in range(len(trigger)):
+            self.controller.press(Key.backspace)
+            self.controller.release(Key.backspace)
+
+        self.controller.type(replacement)
+        self.buffer = ""
+    finally:
+        self.injecting = False
+```
+
+The `finally` block is mandatory so an injection error cannot permanently disable the listener.
+
+---
+
+## 12. Concurrency model
+
+POC preference: keep the design single-purpose and simple.
+
+The `pynput.keyboard.Listener` executes callbacks on its listener thread. Expansion MAY occur in that callback for the initial POC.
+
+If testing shows callback reentrancy or timing problems, expansion SHOULD be moved to one dedicated worker thread via `queue.Queue`.
+
+Do not create one thread per expansion.
+
+Preferred fallback architecture:
+
+```text
+Listener callback
+    ↓
+ExpansionRequest(trigger, replacement)
+    ↓
+queue.Queue
+    ↓
+single expansion worker
+```
+
+This keeps expansion serialized.
+
+---
+
+## 13. Recursion prevention
+
+This is a hard requirement.
+
+Example problematic rule:
+
+```yaml
+expansions:
+  '\\a': '\\a hello'
+```
+
+Without a guard, injected `\\a` could trigger another expansion.
+
+All events generated while `injecting == True` MUST be ignored by matching logic.
+
+After injection completes:
+
+```text
+injecting = False
+buffer = ""
+```
+
+The POC does not attempt to distinguish injected events using OS-level metadata because that would require lower-level Windows APIs outside the dependency scope.
+
+---
+
+## 14. Logging
+
+Default logging level: `INFO`.
+
+Allowed logs:
+
+```text
+INFO  configuration loaded: 3 expansions
+INFO  keyboard listener started
+INFO  expansion triggered: \\a
+INFO  shutting down
+ERROR configuration invalid: ...
+ERROR expansion failed for trigger \\a: ...
+```
+
+The replacement MAY be omitted from logs.
+
+The application MUST NOT log:
+
+- normal typed characters;
+- rolling-buffer content;
+- surrounding text;
+- clipboard contents;
+- passwords or input-field contents.
+
+This requirement is intentional: `myexpand` is a text expander, not a keylogger.
+
+---
+
+## 15. Privacy and security constraints
+
+### POC guarantees
+
+`myexpand` MUST:
+
+- keep only a bounded rolling buffer in memory;
+- never persist keyboard input;
+- never send keyboard data over the network;
+- never run hidden from the user by design;
+- never attempt privilege escalation;
+- operate only in the current interactive user's session.
+
+### Known limitation
+
+Because the POC uses a global keyboard listener, trigger characters may temporarily exist in the in-memory rolling buffer even when typed into sensitive fields.
+
+The POC cannot reliably identify password fields using only `pynput` and PyYAML.
+
+Therefore:
+
+- the buffer MUST remain bounded;
+- the buffer MUST never be logged or persisted;
+- production use in high-security environments requires further review.
+
+---
+
+## 16. Error handling
+
+### Configuration errors
+
+Fail fast before starting the keyboard listener.
+
+Example:
+
+```text
+ERROR: config.yaml: expansions must be a mapping
+```
+
+Exit code:
+
+```text
+2
+```
+
+### Listener startup failure
+
+Log error and exit non-zero.
+
+### Expansion failure
+
+If Backspace or text injection raises an exception:
+
+1. log the trigger identifier;
+2. clear internal buffer;
+3. restore `injecting = False`;
+4. continue listening if safe.
+
+---
+
+## 17. Graceful shutdown
+
+The primary supported development shutdown is Ctrl+C in the console.
+
+Expected behavior:
+
+```text
+Ctrl+C
+  ↓
+stop listener
+  ↓
+join listener
+  ↓
+exit 0
+```
+
+The program should not leave worker threads running after shutdown.
+
+---
+
+## 18. CLI
+
+Required command:
+
+```bash
+uv run python -m myexpand --config config.yaml
+```
+
+Optional convenience:
+
+```bash
+uv run myexpand --config config.yaml
+```
+
+with `pyproject.toml`:
+
+```toml
+[project.scripts]
+myexpand = "myexpand.__main__:main"
+```
+
+Minimal CLI options:
+
+```text
+--config PATH
+--log-level DEBUG|INFO|WARNING|ERROR
+```
+
+No daemonization CLI is required.
+
+---
+
+## 19. `uv` bootstrap
+
+```powershell
+uv init myexpand
+cd myexpand
+
+uv add pynput pyyaml
+```
+
+Recommended `pyproject.toml` baseline:
+
+```toml
+[project]
+name = "myexpand"
+version = "0.1.0"
+description = "Minimal Windows global text expander POC"
+requires-python = ">=3.12"
+dependencies = [
+    "pynput>=1.7,<2",
+    "PyYAML>=6,<7",
+]
+
+[project.scripts]
+myexpand = "myexpand.__main__:main"
+```
+
+Run:
+
+```powershell
+uv run myexpand --config config.yaml
+```
+
+---
+
+## 20. Unit-test scope
+
+Automated tests SHOULD focus on logic that does not require real global keyboard injection.
+
+### Configuration tests
+
+Test:
+
+- valid expansion map;
+- missing `expansions`;
+- non-string trigger;
+- empty trigger;
+- non-string replacement.
+
+### Matcher tests
+
+Given:
+
+```python
+{
+    r"\\a": "testtesttest",
+    r"\\abc": "ABC",
+}
+```
+
+validate:
+
+```text
+"\\"       → no match
+"\\a"      → \\a
+"x\\a"     → \\a
+"\\ab"     → no match
+"\\abc"    → \\abc
+```
+
+### Buffer tests
+
+Validate:
+
+- bounded maximum length;
+- Backspace removes one character;
+- boundary key clears buffer;
+- buffer clears after expansion.
+
+Real OS-level keyboard behavior remains a manual integration test for this POC.
+
+---
+
+## 21. Manual test plan
+
+Use this configuration:
+
+```yaml
+expansions:
+  '\\a': 'testtesttest'
+  '\\2m': 'Give me a two-minute overview.'
+```
+
+### Test 1 — Notepad
+
+Type:
+
+```text
+hello \\a
+```
+
+Expected:
+
+```text
+hello testtesttest
+```
+
+### Test 2 — Browser
+
+Open a normal text field in Edge or Chrome.
+
+Type:
+
+```text
+\\2m
+```
+
+Expected:
+
+```text
+Give me a two-minute overview.
+```
+
+### Test 3 — VS Code
+
+Inside an unsaved text document, type:
+
+```text
+\\a
+```
+
+Expected:
+
+```text
+testtesttest
+```
+
+### Test 4 — partial trigger correction
+
+Type:
+
+```text
+\\x
+```
+
+then Backspace, then:
+
+```text
+a
+```
+
+Expected final expansion:
+
+```text
+testtesttest
+```
+
+### Test 5 — recursion guard
+
+Configure:
+
+```yaml
+expansions:
+  '\\a': '\\a test'
+```
+
+Type:
+
+```text
+\\a
+```
+
+Expected exactly one expansion:
+
+```text
+\\a test
+```
+
+No loop may occur.
+
+### Test 6 — privacy
+
+Run at INFO logging level and type arbitrary text.
+
+Expected:
+
+- normal text does not appear in logs;
+- only matched trigger identifiers may appear.
+
+---
+
+## 22. Acceptance criteria
+
+The POC is complete when all of the following are true:
+
+- [ ] project installs with `uv sync`;
+- [ ] only `pynput` and `PyYAML` are external runtime dependencies;
+- [ ] YAML expansion rules load correctly;
+- [ ] a global keyboard listener starts on Windows;
+- [ ] `\\a` can expand to `testtesttest`;
+- [ ] replacement works in Notepad;
+- [ ] replacement works in a Chromium browser text field;
+- [ ] replacement works in VS Code;
+- [ ] user Backspace correctly updates the trigger buffer;
+- [ ] injected replacement events do not recursively expand;
+- [ ] trigger buffer is bounded to maximum trigger length;
+- [ ] normal keystrokes are never logged or persisted;
+- [ ] invalid YAML/config fails before listener startup;
+- [ ] Ctrl+C exits cleanly.
+
+---
+
+## 23. Implementation milestones
+
+### M0 — skeleton
+
+Deliver:
+
+- `pyproject.toml`;
+- package structure;
+- YAML loader;
+- CLI startup.
+
+Validation:
+
+```powershell
+uv run myexpand --config config.yaml
+```
+
+loads configuration and exits/starts without import errors.
+
+### M1 — listener and matcher
+
+Deliver:
+
+- global `pynput` listener;
+- bounded buffer;
+- trigger matcher;
+- Backspace/boundary handling.
+
+Validation:
+
+Log only matched trigger names during development.
+
+### M2 — replacement
+
+Deliver:
+
+- Backspace deletion;
+- replacement injection;
+- recursion guard.
+
+Validation:
+
+```text
+\\a → testtesttest
+```
+
+works reliably across the three target applications.
+
+### M3 — hardening
+
+Deliver:
+
+- clean shutdown;
+- configuration validation;
+- matcher/config unit tests;
+- minimal README.
+
+At M3 the POC is considered complete.
+
+---
+
+## 24. Known POC risks
+
+### Keyboard-layout differences
+
+`pynput` behavior can vary with keyboard layouts, dead keys, AltGr, and IMEs.
+
+POC target: standard US-English keyboard input first.
+
+### Injection timing
+
+Some applications may process Backspace and injected text asynchronously. If replacement is unreliable, add a very small configurable delay between deletion and typing only after reproducing the problem.
+
+Do not add sleeps preemptively.
+
+### Elevated applications
+
+A normal user process may not be able to inject input into applications running at higher integrity levels.
+
+This is accepted for the POC.
+
+### Rich editors
+
+Some browser editors, remote desktops, terminal emulators, games, or protected inputs may behave differently from standard text controls.
+
+They are outside the initial acceptance target.
+
+### IME / Chinese input
+
+The initial POC does not guarantee trigger detection while a Chinese/Japanese/Korean IME is composing text.
+
+This should be evaluated separately after the basic US-English path is stable.
+
+---
+
+## 25. Decision after POC
+
+If the POC proves reliable, the next version should evaluate, in this order:
+
+1. application exclusion rules;
+2. config hot reload;
+3. Windows login auto-start;
+4. tray status/pause control;
+5. safe clipboard-based insertion for long/multiline expansions;
+6. native Win32 keyboard hooks only if `pynput` reliability proves insufficient.
+
+The POC should **not** prematurely introduce Windows-specific native APIs. Its purpose is to determine whether `pynput + PyYAML` is sufficient for the user's normal text-expansion workflow.
