@@ -1,0 +1,1 @@
+https://github.com/conorbronsdon/avoid-ai-writing
